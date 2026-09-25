@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <linux/sockios.h>
 #include <time.h>
 #include "log.h"
@@ -19,7 +20,6 @@
 
 typedef struct {
     int fd;
-    size_t last_size;
     struct timespec last_time;
     int num_frames;
     int num_dropped;
@@ -133,7 +133,6 @@ static bool sock_accept_clients(sock_ctx_t *ctx)
 
         if (slot) {
             slot->fd = client_fd;
-            slot->last_size = 0;
             slot->num_frames = 0;
             slot->num_dropped = 0;
             clock_gettime(CLOCK_MONOTONIC, &slot->last_time);
@@ -209,6 +208,22 @@ static ssize_t sock_write_client_fd(int fd, const void *data, size_t size)
     return size;
 }
 
+// A frame larger than the send buffer only completes while the reader keeps
+// draining it, so any backlog would end in a write timeout mid-frame. A frame
+// that fits may queue until a whole frame is backed up.
+static bool sock_client_is_behind(int fd, size_t size)
+{
+    int unsent = 0, sndbuf = 0;
+    socklen_t len = sizeof(sndbuf);
+
+    if (ioctl(fd, SIOCOUTQ, &unsent) < 0 || unsent <= 0)
+        return false;
+    if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, &len) == 0 &&
+        sndbuf > 0 && (size_t)sndbuf < size)
+        return true;
+    return (size_t)unsent >= size;
+}
+
 static void sock_close_client(sock_ctx_t *ctx, int i, const char *reason)
 {
     assert(i >= 0 && i < SOCK_MAX_CLIENTS);
@@ -240,14 +255,9 @@ static void sock_write_cb(const void *data, size_t size, void *arg)
             continue;
         }
 
-        if (ctx->allow_drops && client->last_size) {
-            int unsent = 0;
-            if (ioctl(client->fd, SIOCOUTQ, &unsent) == 0) {
-                if ((size_t)unsent >= client->last_size) {
-                    client->num_dropped++;
-                    continue;
-                }
-            }
+        if (ctx->allow_drops && sock_client_is_behind(client->fd, size)) {
+            client->num_dropped++;
+            continue;
         }
 
         if (sock_write_client_fd(client->fd, data, size) < 0) {
@@ -259,7 +269,6 @@ static void sock_write_cb(const void *data, size_t size, void *arg)
             continue;
         }
 
-        client->last_size = size;
         client->last_time = now;
         client->num_frames++;
 

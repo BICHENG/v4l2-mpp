@@ -297,6 +297,7 @@ int main(int argc, char *argv[])
         log_errorf( "Failed to open raw socket\n");
         goto error;
     }
+    raw_frame_sock.allow_drops = true;
 
     if (v4l2_capture_start(&v4l2) < 0) {
         log_errorf( "Failed to start V4L2 streaming\n");
